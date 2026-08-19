@@ -332,19 +332,20 @@ def _keepout_shapes(board, via_radius_nm, span):
     return circles
 
 
-def _track_keepout_shapes(board, net_name, via_radius_nm, clearances):
-    """Clearance areas around other nets' tracks, on any copper layer.
+def _track_keepout_shapes(board, net_name, via_radius_nm, clearances, span):
+    """Clearance areas around other nets' tracks on the layers the via spans.
 
-    A through via's drill spans every copper layer of the board, not just the
-    ones `net_name` happens to be poured on, so a track on a layer the pour
-    never touches (an outer signal layer over an inner GND plane, say) still
-    has to be avoided or the via drills straight through it.
+    The via's drill only crosses the copper layers between its start and end,
+    so only tracks on those layers can collide with it. For a through via the
+    span is the whole stack and this matches the old behavior.
     """
     from shapely.geometry import LineString
-
+    span_set = set(span)
     shapes = []
     for track in board.get_tracks():
         if track.net.name == net_name:
+            continue
+        if track.layer not in span_set:
             continue
         if isinstance(track, ArcTrack):
             coords = [
@@ -360,21 +361,23 @@ def _track_keepout_shapes(board, net_name, via_radius_nm, clearances):
     return shapes
 
 
-def _zone_keepout_shapes(zones, net_name, via_radius_nm, clearances):
+def _zone_keepout_shapes(zones, net_name, via_radius_nm, clearances, span):
     """Clearance areas around other nets' filled zones, on any layer.
-
     A through via's drill spans every copper layer, so a filled zone for a
     different net on a layer `net_name` never pours on (an inner power plane
     under a GND-poured outer layer, say) can still be worth avoiding, even
     though KiCad's refill would clear the fill back around the via by itself.
     """
+    span_set = set(span)
     shapes = []
     for zone in zones:
         net = zone.net
         if net is not None and net.name == net_name:
             continue
         margin = via_radius_nm + clearances[net.name if net is not None else ""]
-        for filled in zone.filled_polygons.values():
+        for layer, filled in zone.filled_polygons.items():
+            if layer not in span_set:
+                continue
             for pwh in filled:
                 poly = _polygon_with_holes_to_shapely(pwh)
                 if poly is not None:
@@ -383,7 +386,7 @@ def _zone_keepout_shapes(zones, net_name, via_radius_nm, clearances):
     return shapes
 
 
-def _rule_area_keepout_shapes(zones, via_radius_nm):
+def _rule_area_keepout_shapes(zones, via_radius_nm, span):
     """Outlines of rule areas that forbid vias.
 
     A rule area is an explicit "keep out" from whoever laid the board out, so
@@ -396,11 +399,14 @@ def _rule_area_keepout_shapes(zones, via_radius_nm):
     kipy 0.7.1 wraps a zone's copper settings but not its RuleAreaSettings, so
     the restriction flags are read off the proto.
     """
+    span_set = set(span)
     shapes = []
     for zone in zones:
         if not zone.is_rule_area():
             continue
         if not zone.proto.rule_area_settings.keepout_vias:
+            continue
+        if not (set(zone.layers) & span_set):
             continue
         # Zone.outline indexes polygons[0], which an empty PolySet would not have.
         if not zone.proto.outline.polygons:
@@ -412,7 +418,7 @@ def _rule_area_keepout_shapes(zones, via_radius_nm):
     return shapes
 
 
-def _footprint_keepout_shapes(board, net_name, via_radius_nm, clearances):
+def _footprint_keepout_shapes(board, net_name, via_radius_nm, clearances, span):
     """Clearance areas around every footprint's bounding box.
 
     Keeps vias out from under component bodies (BGAs, connectors, anything
@@ -421,7 +427,9 @@ def _footprint_keepout_shapes(board, net_name, via_radius_nm, clearances):
     """
     from shapely.geometry import box as shapely_box
 
-    footprints = board.get_footprints()
+    span_set = set(span)
+
+    footprints = [fp for fp in board.get_footprints() if fp.layer in span_set]
     if not footprints:
         return []
 
@@ -601,12 +609,12 @@ def stitch(
     # layer, plus whatever else the dialog asked for.
     clearances = _net_clearances(board, nets, net_name)
     keepout = _keepout_shapes(board, via_radius_nm, span)
-    keepout += _rule_area_keepout_shapes(zones, via_radius_nm)
-    keepout += _track_keepout_shapes(board, net_name, via_radius_nm, clearances)
+    keepout += _rule_area_keepout_shapes(zones, via_radius_nm, span)
+    keepout += _track_keepout_shapes(board, net_name, via_radius_nm, clearances, span)
     if avoid_other_zones:
-        keepout += _zone_keepout_shapes(zones, net_name, via_radius_nm, clearances)
+        keepout += _zone_keepout_shapes(zones, net_name, via_radius_nm, clearances, span)
     if avoid_footprints:
-        keepout += _footprint_keepout_shapes(board, net_name, via_radius_nm, clearances)
+        keepout += _footprint_keepout_shapes(board, net_name, via_radius_nm, clearances, span)
 
     blocked = _blocked_predicate(keepout)
     points = [
